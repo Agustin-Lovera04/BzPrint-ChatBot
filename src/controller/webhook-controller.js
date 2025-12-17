@@ -1,6 +1,12 @@
 import { config } from "../config/config.js";
 import { IAServiceInstance } from "../service/Ia-service.js";
 
+// Estado mínimo de conversaciones activas (en memoria)
+const activeConversations = new Map();
+
+// WhatsApp considera activa una conversación por 24 horas
+const CONVERSATION_TTL = 24 * 60 * 60 * 1000;
+
 export class WebhookController {
 
   static async verifyWebhook(req, res) {
@@ -22,11 +28,10 @@ export class WebhookController {
   static async receiveWebhook(req, res) {
     console.log("📩 Webhook recibido:", JSON.stringify(req.body, null, 2));
 
-    //Esto se hace por: Meta exige que responda en menos de 10 segundos.
+    //Meta exige responder en menos de 10 segundos
     res.sendStatus(200);
 
     try {
-
       //Desarticulamos la estructura del webhook, para obtener los datos
       const entry = req.body.entry?.[0]?.changes?.[0];
       if (!entry) return;
@@ -37,86 +42,227 @@ export class WebhookController {
 
       const from = message.from;
       const text = message.text?.body;
+      const now = Date.now();
 
       console.log("Mensaje de:", from);
-      console.log("Texto:", text);
+      console.log("Tipo de mensaje:", message.type);
 
+      // ==========================================
+      // DETECCIÓN DE INICIO DE CONVERSACIÓN
+      // ==========================================
+      const conversation = activeConversations.get(from);
+      const isNewConversation =
+        !conversation || (now - conversation.lastMessageAt > CONVERSATION_TTL);
 
-      /* //Construimos coincidencia para responder solamente rapido
-      if (text?.toLowerCase() === "hola") {
-        WebhookController.sendAutoReply(from);
+      if (isNewConversation) {
+        activeConversations.set(from, { lastMessageAt: now });
+        await WebhookController.sendStudentQuestion(from);
+        return;
+      }
+
+      // Actualizamos timestamp de conversación activa
+      conversation.lastMessageAt = now;
+
+      // ==========================================
+      // MENSAJES INTERACTIVOS (BOTONES / LISTAS)
+      // ==========================================
+      if (message.type === "interactive") {
+
+        // Respuesta a botones
+        if (message.interactive?.button_reply) {
+          const buttonId = message.interactive.button_reply.id;
+          console.log("Botón presionado:", buttonId);
+
+          if (buttonId === "student_yes") {
+            await WebhookController.sendStudentMaterialsList(from);
+            return;
+          }
+
+          if (buttonId === "student_no") {
+            await WebhookController.sendAutoReply(
+              from,
+              "Perfecto. Podés enviarme el archivo que necesitás imprimir."
+            );
+            return;
+          }
+        }
+
+        // Respuesta a listas
+        if (message.interactive?.list_reply) {
+          const listId = message.interactive.list_reply.id;
+          console.log("Elemento de lista seleccionado:", listId);
+
+          await WebhookController.sendAutoReply(
+            from,
+            "Genial 👍 Ese material ya lo tengo. ¿Querés agregar otro archivo?"
+          );
+          return;
+        }
+      }
+
+      // ==========================================
+      // FALLBACK → IA
+      // ==========================================
+      if (text) {
+        const aiReply = await IAServiceInstance.ask(text);
+        await WebhookController.sendAutoReply(from, aiReply);
       }
 
     } catch (err) {
       console.error("Error procesando webhook:", err);
     }
-  } */
-    if (text) {
-            const aiReply = await IAServiceInstance.ask(text)
-            await WebhookController.sendAutoReply(from, aiReply);
-          }
+  }
 
-        } catch (err) {
-          console.error("Error procesando webhook:", err);
-        }
-      }
-
-
+  // ==========================================
+  // MENSAJE DE TEXTO SIMPLE
+  // ==========================================
   static async sendAutoReply(to, message) {
-  try {
-    console.log("=== DEBUG INICIO ===");
-    console.log("Número CRUDO del webhook:", to);
-    
-    //Formateamos el numero para que llegue correctamente a META
-    const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
-    
-    console.log("Número para Meta:", metaFormattedNumber);
-    console.log("Usando Phone ID:", config.WHATSAPP_PHONE_ID);
-    console.log('to', to)
-    
-    //Fetch con estructura correcta para envio de mensajes
-    const response = await fetch(
-      `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to: metaFormattedNumber, 
-          type: "text",
-          text: { body: message }
-        })
-      }
-    );
+    try {
+      const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
 
-    const data = await response.json();
-    console.log("Resultado de Meta:", data);
+      await fetch(
+        `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.WHATSAPP_TOKEN}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            messaging_product: "whatsapp",
+            to: metaFormattedNumber,
+            type: "text",
+            text: { body: message }
+          })
+        }
+      );
 
-  } catch (e) {
-    console.error("Error enviando respuesta automática:", e);
+    } catch (e) {
+      console.error("Error enviando mensaje de texto:", e);
+    }
   }
-}
 
-static convertToMetaFormat(whatsappNumber) {
+  // ==========================================
+  // BOTONES: ¿SOS ESTUDIANTE?
+  // ==========================================
+  static async sendStudentQuestion(to) {
+    try {
+      const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
 
-  if (whatsappNumber.startsWith('549') && whatsappNumber.length === 13) {
-    
-    const countryCode = '54';
-    const areaCode = whatsappNumber.substring(2, 5); 
-    
-    
-    const actualAreaCode = whatsappNumber.substring(3, 6); 
-    const number = whatsappNumber.substring(6); 
+      await fetch(
+        `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.WHATSAPP_TOKEN}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            messaging_product: "whatsapp",
+            to: metaFormattedNumber,
+            type: "interactive",
+            interactive: {
+              type: "button",
+              body: {
+                text: "Hola 👋 Soy el bot de Bz Print.\nPara ayudarte mejor:\n¿Sos estudiante?"
+              },
+              action: {
+                buttons: [
+                  {
+                    type: "reply",
+                    reply: {
+                      id: "student_yes",
+                      title: "Sí"
+                    }
+                  },
+                  {
+                    type: "reply",
+                    reply: {
+                      id: "student_no",
+                      title: "No"
+                    }
+                  }
+                ]
+              }
+            }
+          })
+        }
+      );
 
-    const metaFormat = countryCode + actualAreaCode + '15' + number;
-    console.log(`Conversión: ${whatsappNumber} -> ${metaFormat}`);
-    
-    return metaFormat; 
+    } catch (e) {
+      console.error("Error enviando botones de estudiante:", e);
+    }
   }
-  
-  return whatsappNumber;
-}
+
+  // ==========================================
+  // LISTA DE MATERIALES PARA ESTUDIANTES
+  // ==========================================
+  static async sendStudentMaterialsList(to) {
+    try {
+      const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
+
+      await fetch(
+        `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.WHATSAPP_TOKEN}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            messaging_product: "whatsapp",
+            to: metaFormattedNumber,
+            type: "interactive",
+            interactive: {
+              type: "list",
+              body: {
+                text: "Estos son los materiales más pedidos por estudiantes. Elegí uno:"
+              },
+              footer: {
+                text: "Bz Print"
+              },
+              action: {
+                button: "Ver materiales",
+                sections: [
+                  {
+                    title: "Libros y apuntes",
+                    rows: [
+                      {
+                        id: "book_argenta",
+                        title: "Argenta",
+                        description: "Libro completo – 120 MB"
+                      },
+                      {
+                        id: "book_latasher",
+                        title: "Latasher",
+                        description: "Tomo 1 – 95 MB"
+                      },
+                      {
+                        id: "book_abogacia",
+                        title: "Abogacia",
+                        description: "PDF / Word"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          })
+        }
+      );
+
+    } catch (e) {
+      console.error("Error enviando lista de materiales:", e);
+    }
+  }
+
+  static convertToMetaFormat(whatsappNumber) {
+    if (whatsappNumber.startsWith("549") && whatsappNumber.length === 13) {
+      const countryCode = "54";
+      const actualAreaCode = whatsappNumber.substring(3, 6);
+      const number = whatsappNumber.substring(6);
+      return countryCode + actualAreaCode + "15" + number;
+    }
+    return whatsappNumber;
+  }
 }
