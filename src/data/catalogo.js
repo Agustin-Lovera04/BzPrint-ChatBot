@@ -16,5 +16,11 @@ export const listaDeArchivos = [
     title: "Abogacía",
     description: "PDF / Word",
     type: "notes"
+  },
+  {
+    id: "otros",
+    title: "Otros archivos",
+    description: "PDF / Word",
+    type: "files"
   }
 ];
