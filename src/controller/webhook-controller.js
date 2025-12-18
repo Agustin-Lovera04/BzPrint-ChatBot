@@ -1,21 +1,36 @@
 import { config } from "../config/config.js";
 import { IAServiceInstance } from "../service/Ia-service.js";
+import { listaDeArchivos } from "../data/catalogo.js";
+import {
+  buildStudentMaterialsList,
+  buildButtonQuestion
+} from "../../utils/whatsapp-builders.js";
 
-// Estado mínimo de conversaciones activas (en memoria)
+// ==========================================
+// ESTADO DE CONVERSACIONES (EN MEMORIA)
+// ==========================================
 const activeConversations = new Map();
-
-// WhatsApp considera activa una conversación por 24 horas
 const CONVERSATION_TTL = 24 * 60 * 60 * 1000;
+
+// Estados posibles del flujo
+const STATES = {
+  WAIT_STUDENT_ANSWER: "WAIT_STUDENT_ANSWER",
+  WAIT_MATERIAL: "WAIT_MATERIAL",
+  WAIT_MORE_FILES: "WAIT_MORE_FILES",
+  WAIT_FILES: "WAIT_FILES",
+  PRINT_OPTIONS: "PRINT_OPTIONS"
+};
 
 export class WebhookController {
 
+  // ==========================================
+  // VERIFICACIÓN DE WEBHOOK
+  // ==========================================
   static async verifyWebhook(req, res) {
-    //Requisitos pedidos para verificar a webhook
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-    //Si coinciden, quiere decir que Meta está verificando tu webhook y espera que le devuelvas el challenge
     if (mode === "subscribe" && token === config.VERIFY_TOKEN) {
       console.log("Webhook verificado correctamente.");
       return res.status(200).send(challenge);
@@ -24,15 +39,16 @@ export class WebhookController {
     return res.sendStatus(403);
   }
 
-  //Aca llegan todos los mensajes
+  // ==========================================
+  // RECEPCIÓN DE MENSAJES
+  // ==========================================
   static async receiveWebhook(req, res) {
     console.log("📩 Webhook recibido:", JSON.stringify(req.body, null, 2));
 
-    //Meta exige responder en menos de 10 segundos
+    // Meta exige responder rápido
     res.sendStatus(200);
 
     try {
-      //Desarticulamos la estructura del webhook, para obtener los datos
       const entry = req.body.entry?.[0]?.changes?.[0];
       if (!entry) return;
 
@@ -44,64 +60,110 @@ export class WebhookController {
       const text = message.text?.body;
       const now = Date.now();
 
-      console.log("Mensaje de:", from);
-      console.log("Tipo de mensaje:", message.type);
-
       // ==========================================
-      // DETECCIÓN DE INICIO DE CONVERSACIÓN
+      // INICIO / TTL DE CONVERSACIÓN
       // ==========================================
       const conversation = activeConversations.get(from);
       const isNewConversation =
         !conversation || (now - conversation.lastMessageAt > CONVERSATION_TTL);
 
       if (isNewConversation) {
-        activeConversations.set(from, { lastMessageAt: now });
+        activeConversations.set(from, {
+          lastMessageAt: now,
+          state: STATES.WAIT_STUDENT_ANSWER
+        });
+
         await WebhookController.sendStudentQuestion(from);
         return;
       }
 
-      // Actualizamos timestamp de conversación activa
       conversation.lastMessageAt = now;
+      const { state } = conversation;
+
+      console.log("Estado actual:", state);
+      console.log("Tipo de mensaje:", message.type);
 
       // ==========================================
-      // MENSAJES INTERACTIVOS (BOTONES / LISTAS)
+      // MENSAJES INTERACTIVOS
       // ==========================================
       if (message.type === "interactive") {
 
-        // Respuesta a botones
+        // ---------- BOTONES ----------
         if (message.interactive?.button_reply) {
           const buttonId = message.interactive.button_reply.id;
           console.log("Botón presionado:", buttonId);
 
-          if (buttonId === "student_yes") {
-            await WebhookController.sendStudentMaterialsList(from);
-            return;
+          // RESPUESTA A ¿SOS ESTUDIANTE?
+          if (state === STATES.WAIT_STUDENT_ANSWER) {
+            if (buttonId === "student_yes") {
+              conversation.state = STATES.WAIT_MATERIAL;
+              await WebhookController.sendStudentMaterialsList(from);
+              return;
+            }
+
+            if (buttonId === "student_no") {
+              conversation.state = STATES.WAIT_FILES;
+              await WebhookController.sendAutoReply(
+                from,
+                "Perfecto. Podés enviarme el archivo que necesitás imprimir."
+              );
+              return;
+            }
           }
 
-          if (buttonId === "student_no") {
-            await WebhookController.sendAutoReply(
-              from,
-              "Perfecto. Podés enviarme el archivo que necesitás imprimir."
-            );
-            return;
+          // RESPUESTA A ¿AGREGAR MÁS ARCHIVOS?
+          if (state === STATES.WAIT_MORE_FILES) {
+            if (buttonId === "add_files") {
+              conversation.state = STATES.WAIT_MATERIAL;
+              await WebhookController.sendStudentMaterialsList(from);
+              return;
+            }
+
+            if (buttonId === "finally_files") {
+              conversation.state = STATES.PRINT_OPTIONS;
+              await WebhookController.sendAutoReply(
+                from,
+                "Perfecto. Continuamos con las opciones de impresión."
+              );
+              return;
+            }
           }
         }
 
-        // Respuesta a listas
-        if (message.interactive?.list_reply) {
+        // ---------- LISTAS ----------
+        if (
+          message.interactive?.list_reply &&
+          state === STATES.WAIT_MATERIAL
+        ) {
           const listId = message.interactive.list_reply.id;
-          console.log("Elemento de lista seleccionado:", listId);
+          console.log("Elemento seleccionado:", listId);
+
+          const selectedMaterial = listaDeArchivos.find(
+            mat => mat.id === listId
+          );
+
+          if (!selectedMaterial) {
+            await WebhookController.sendAutoReply(
+              from,
+              "No pude identificar el material seleccionado."
+            );
+            return;
+          }
+
+          conversation.state = STATES.WAIT_MORE_FILES;
 
           await WebhookController.sendAutoReply(
             from,
-            "Genial 👍 Ese material ya lo tengo. ¿Querés agregar otro archivo?"
+            `Perfecto. Seleccionaste *${selectedMaterial.title}*.`
           );
+
+          await WebhookController.sendAddMoreFilesQuestion(from);
           return;
         }
       }
 
       // ==========================================
-      // FALLBACK → IA
+      // FALLBACK → IA (SOLO SI NO ROMPE EL FLUJO)
       // ==========================================
       if (text) {
         const aiReply = await IAServiceInstance.ask(text);
@@ -114,7 +176,7 @@ export class WebhookController {
   }
 
   // ==========================================
-  // MENSAJE DE TEXTO SIMPLE
+  // ENVÍO DE TEXTO SIMPLE
   // ==========================================
   static async sendAutoReply(to, message) {
     try {
@@ -143,11 +205,12 @@ export class WebhookController {
   }
 
   // ==========================================
-  // BOTONES: ¿SOS ESTUDIANTE?
+  // ENVÍO GENÉRICO DE BOTONES
   // ==========================================
-  static async sendStudentQuestion(to) {
+  static async sendButtonQuestion(to, questionConfig) {
     try {
       const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
+      const payload = buildButtonQuestion(questionConfig);
 
       await fetch(
         `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
@@ -160,46 +223,47 @@ export class WebhookController {
           body: JSON.stringify({
             messaging_product: "whatsapp",
             to: metaFormattedNumber,
-            type: "interactive",
-            interactive: {
-              type: "button",
-              body: {
-                text: "Hola 👋 Soy el bot de Bz Print.\nPara ayudarte mejor:\n¿Sos estudiante?"
-              },
-              action: {
-                buttons: [
-                  {
-                    type: "reply",
-                    reply: {
-                      id: "student_yes",
-                      title: "Sí"
-                    }
-                  },
-                  {
-                    type: "reply",
-                    reply: {
-                      id: "student_no",
-                      title: "No"
-                    }
-                  }
-                ]
-              }
-            }
+            ...payload
           })
         }
       );
 
     } catch (e) {
-      console.error("Error enviando botones de estudiante:", e);
+      console.error("Error enviando botones:", e);
     }
   }
 
   // ==========================================
-  // LISTA DE MATERIALES PARA ESTUDIANTES
+  // PREGUNTAS CONCRETAS (REUTILIZAN BUILDER)
+  // ==========================================
+  static async sendStudentQuestion(to) {
+    return WebhookController.sendButtonQuestion(to, {
+      text: "Hola 👋 Soy el bot de Bz Print.\nPara ayudarte mejor:\n¿Sos estudiante?",
+      buttons: [
+        { id: "student_yes", title: "Sí" },
+        { id: "student_no", title: "No" }
+      ]
+    });
+  }
+
+  static async sendAddMoreFilesQuestion(to) {
+    return WebhookController.sendButtonQuestion(to, {
+      text:
+        "Antes de seguir con las opciones de impresión,\n¿querés agregar más archivos a tu pedido?",
+      buttons: [
+        { id: "add_files", title: "Sí" },
+        { id: "finally_files", title: "No" }
+      ]
+    });
+  }
+
+  // ==========================================
+  // LISTA DE MATERIALES
   // ==========================================
   static async sendStudentMaterialsList(to) {
     try {
       const metaFormattedNumber = WebhookController.convertToMetaFormat(to);
+      const payload = buildStudentMaterialsList(listaDeArchivos);
 
       await fetch(
         `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
@@ -212,41 +276,7 @@ export class WebhookController {
           body: JSON.stringify({
             messaging_product: "whatsapp",
             to: metaFormattedNumber,
-            type: "interactive",
-            interactive: {
-              type: "list",
-              body: {
-                text: "Estos son los materiales más pedidos por estudiantes. Elegí uno:"
-              },
-              footer: {
-                text: "Bz Print"
-              },
-              action: {
-                button: "Ver materiales",
-                sections: [
-                  {
-                    title: "Libros y apuntes",
-                    rows: [
-                      {
-                        id: "book_argenta",
-                        title: "Argenta",
-                        description: "Libro completo – 120 MB"
-                      },
-                      {
-                        id: "book_latasher",
-                        title: "Latasher",
-                        description: "Tomo 1 – 95 MB"
-                      },
-                      {
-                        id: "book_abogacia",
-                        title: "Abogacia",
-                        description: "PDF / Word"
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
+            ...payload
           })
         }
       );
@@ -256,6 +286,9 @@ export class WebhookController {
     }
   }
 
+  // ==========================================
+  // FORMATO DE NÚMERO PARA META
+  // ==========================================
   static convertToMetaFormat(whatsappNumber) {
     if (whatsappNumber.startsWith("549") && whatsappNumber.length === 13) {
       const countryCode = "54";
