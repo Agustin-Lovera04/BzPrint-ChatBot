@@ -11,5 +11,6 @@ export const config = {
     VERIFY_TOKEN: process.env.VERIFY_TOKEN,
     WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
     WHATSAPP_PHONE_ID: process.env.WHATSAPP_PHONE_ID,
-    GROQ_API_KEY: process.env.GROQ_API_KEY
+    GROQ_API_KEY: process.env.GROQ_API_KEY,
+    META_APP_SECRET: process.env.META_APP_SECRET
 }
