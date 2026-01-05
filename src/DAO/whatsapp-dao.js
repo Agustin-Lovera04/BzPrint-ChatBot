@@ -1,12 +1,8 @@
 import { config } from "../config/config.js";
-import {
-  buildStudentMaterialsList,
-  buildButtonQuestion,
-} from "../utils/whatsapp-builders.js";
 
 export class WhatsAppDAO {
   convertToMetaFormat(whatsappNumber) {
-    // MISMA lógica que tu controller actual
+    // MISMA lógica que venías usando
     if (whatsappNumber.startsWith("549") && whatsappNumber.length === 13) {
       const countryCode = "54";
       const actualAreaCode = whatsappNumber.substring(3, 6);
@@ -41,10 +37,9 @@ export class WhatsAppDAO {
     }
   }
 
-  async sendButtons(to, questionConfig) {
+  async sendPayload(to, payload) {
     try {
       const metaFormattedNumber = this.convertToMetaFormat(to);
-      const payload = buildButtonQuestion(questionConfig);
 
       await fetch(
         `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
@@ -62,32 +57,7 @@ export class WhatsAppDAO {
         }
       );
     } catch (e) {
-      console.error("Error enviando botones:", e);
-    }
-  }
-
-  async sendMaterialsList(to, materials) {
-    try {
-      const metaFormattedNumber = this.convertToMetaFormat(to);
-      const payload = buildStudentMaterialsList(materials);
-
-      await fetch(
-        `https://graph.facebook.com/v19.0/${config.WHATSAPP_PHONE_ID}/messages`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${config.WHATSAPP_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            messaging_product: "whatsapp",
-            to: metaFormattedNumber,
-            ...payload,
-          }),
-        }
-      );
-    } catch (e) {
-      console.error("Error enviando lista de materiales:", e);
+      console.error("Error enviando payload:", e);
     }
   }
 }
